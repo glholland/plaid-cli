@@ -119,6 +119,9 @@ chocolateys:
     tags: "plaid finance cli golang fintech transactions"
     release_notes: "https://github.com/glholland/plaid-cli/releases/tag/{{ .Tag }}"
     require_license_acceptance: false
-    # Pushed to the Chocolatey Community Repository (subject to moderation).
     source_repo: "https://push.chocolatey.org/"
-    api_key: "{{ .Env.CHOCO_API_KEY }}"
+    # Pack the .nupkg but do not push it here. The Chocolatey Community
+    # Repository moderates every submission and rejects new versions while a
+    # prior one is under review (HTTP 403), which would otherwise fail the whole
+    # release. A dedicated, non-blocking workflow step pushes it instead.
+    skip_publish: true

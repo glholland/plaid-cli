@@ -45,5 +45,24 @@ jobs:
           # SSH private key for the write-enabled deploy key on
           # glholland/homebrew-tap (formula push over git/SSH).
           HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
-          # Chocolatey Community Repository API key (package push).
+
+      # Push the packed .nupkg separately and non-blockingly. The Chocolatey
+      # Community Repository moderates submissions and returns 403 when a prior
+      # version is still under review, so a failure here must not fail the
+      # release — the GitHub release, SBOMs, signature, and Homebrew formula are
+      # already published by this point.
+      - name: Push Chocolatey package
+        continue-on-error: true
+        shell: pwsh
+        env:
           CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          $pkgs = Get-ChildItem -Path dist -Recurse -Filter *.nupkg
+          if (-not $pkgs) {
+            Write-Host "No .nupkg found under dist/; nothing to push."
+            exit 0
+          }
+          foreach ($p in $pkgs) {
+            Write-Host "Pushing $($p.FullName)"
+            choco push $p.FullName --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY
+          }
