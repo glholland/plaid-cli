@@ -3,10 +3,25 @@ name: CI
 on:
   pull_request:
 
+permissions:
+  contents: read
+  # Needed to post/update the CI results comment on the PR.
+  pull-requests: write
+
+# Cancel superseded runs when new commits are pushed to the same PR.
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     name: Lint, Test & Build
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Explicit bash enables `-o pipefail`, so `task ... | tee` still fails
+        # the step when the task fails.
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -22,14 +37,96 @@ jobs:
           version: 3.x
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Each check runs even if an earlier one fails (continue-on-error), so the
+      # PR comment reports every result at once. The final "Fail on errors" step
+      # still fails the job if any check failed.
       - name: Lint
-        run: task lint
+        id: lint
+        continue-on-error: true
+        run: task lint 2>&1 | tee lint-output.txt
 
       - name: Vet
-        run: task vet
+        id: vet
+        continue-on-error: true
+        run: task vet 2>&1 | tee vet-output.txt
 
       - name: Test
-        run: task test
+        id: test
+        continue-on-error: true
+        run: task test 2>&1 | tee test-output.txt
 
       - name: Build
-        run: task build
+        id: build
+        continue-on-error: true
+        run: task build 2>&1 | tee build-output.txt
+
+      - name: Comment results on PR
+        # Fork PRs get a read-only token and cannot comment.
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        env:
+          LINT: ${{ steps.lint.outcome }}
+          VET: ${{ steps.vet.outcome }}
+          TEST: ${{ steps.test.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- plaid-cli-ci-results -->';
+            const icon = { success: '✅', failure: '❌', cancelled: '⚪', skipped: '⏭️' };
+            const checks = [
+              ['Lint (`go fmt` clean)', process.env.LINT, 'lint-output.txt'],
+              ['Vet', process.env.VET, 'vet-output.txt'],
+              ['Test', process.env.TEST, 'test-output.txt'],
+              ['Build', process.env.BUILD, 'build-output.txt'],
+            ];
+            const read = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '');
+            const tail = (s, n) => s.trimEnd().split('\n').slice(-n).join('\n');
+
+            const allPassed = checks.every(([, outcome]) => outcome === 'success');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const sha = context.payload.pull_request.head.sha.slice(0, 7);
+
+            let body = `${marker}\n## ${allPassed ? '✅ CI passed' : '❌ CI failed'}\n\n`;
+            body += `| Check | Result |\n| --- | --- |\n`;
+            for (const [name, outcome] of checks) {
+              body += `| ${name} | ${icon[outcome] ?? '❔'} ${outcome || 'not run'} |\n`;
+            }
+
+            // Test summary: counts of passing/failing tests from `go test -v`.
+            const testOut = read('test-output.txt');
+            const passed = (testOut.match(/^\s*--- PASS/gm) || []).length;
+            const failedTests = testOut.match(/^\s*--- FAIL: \S+/gm) || [];
+            if (testOut) {
+              body += `\n**Tests:** ${passed} passed, ${failedTests.length} failed\n`;
+            }
+            if (failedTests.length) {
+              body += failedTests.map((l) => `- \`${l.trim().replace('--- FAIL: ', '')}\``).join('\n') + '\n';
+            }
+
+            // Show the tail of each failing check's output.
+            for (const [name, outcome, file] of checks) {
+              if (outcome !== 'failure') continue;
+              const out = tail(read(file), 40);
+              if (!out) continue;
+              body += `\n<details><summary>${name} output (last 40 lines)</summary>\n\n\`\`\`\n${out}\n\`\`\`\n</details>\n`;
+            }
+
+            body += `\n<sub>Commit ${sha} · [View run](${runUrl})</sub>`;
+
+            // Update the existing results comment instead of adding a new one per push.
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find((c) => c.user.type === 'Bot' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Fail on errors
+        if: steps.lint.outcome != 'success' || steps.vet.outcome != 'success' || steps.test.outcome != 'success' || steps.build.outcome != 'success'
+        run: |
+          echo "One or more checks failed: lint=${{ steps.lint.outcome }} vet=${{ steps.vet.outcome }} test=${{ steps.test.outcome }} build=${{ steps.build.outcome }}"
+          exit 1
