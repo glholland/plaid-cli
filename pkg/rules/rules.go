@@ -151,19 +151,53 @@ func (r *RulesFileData) SaveRules() error {
 }
 
 // CategoryString derives the Plaid auto-assigned category string for a transaction,
-// preferring the legacy Category slice and falling back to PersonalFinanceCategory.
+// preferring the personal_finance_category taxonomy (Plaid's current, higher-fill
+// categorization) and falling back to the deprecated legacy Category slice.
+// PFC codes are humanized, e.g. FOOD_AND_DRINK / FOOD_AND_DRINK_COFFEE renders
+// as "Food And Drink > Coffee".
 func CategoryString(tx plaid.Transaction) string {
-	if len(tx.Category) > 0 {
-		return strings.Join(tx.Category, " > ")
-	}
-	if tx.PersonalFinanceCategory.IsSet() && tx.PersonalFinanceCategory.Get() != nil {
-		pfc := tx.PersonalFinanceCategory.Get()
-		if pfc.Detailed != "" {
-			return pfc.Primary + " > " + pfc.Detailed
+	if pfc := personalFinanceCategory(tx); pfc != nil && pfc.Primary != "" {
+		primary := humanizeCategoryCode(pfc.Primary)
+		detailed := strings.TrimPrefix(pfc.Detailed, pfc.Primary+"_")
+		if detailed == "" || detailed == pfc.Primary {
+			return primary
 		}
-		return pfc.Primary
+		return primary + " > " + humanizeCategoryCode(detailed)
 	}
-	return ""
+	return legacyCategoryString(tx)
+}
+
+// categorySearchText returns every category representation of a transaction
+// (humanized PFC, raw PFC codes, and the legacy hierarchy) so `category_is`
+// rules written against either taxonomy keep matching after the PFC switch.
+func categorySearchText(tx plaid.Transaction) string {
+	parts := []string{CategoryString(tx), legacyCategoryString(tx)}
+	if pfc := personalFinanceCategory(tx); pfc != nil {
+		parts = append(parts, pfc.Primary, pfc.Detailed)
+	}
+	return strings.ToLower(strings.Join(parts, "\n"))
+}
+
+func personalFinanceCategory(tx plaid.Transaction) *plaid.PersonalFinanceCategory {
+	if tx.PersonalFinanceCategory.IsSet() {
+		return tx.PersonalFinanceCategory.Get()
+	}
+	return nil
+}
+
+func legacyCategoryString(tx plaid.Transaction) string {
+	return strings.Join(tx.Category, " > ")
+}
+
+// humanizeCategoryCode turns an UPPER_SNAKE PFC code into Title Case words.
+func humanizeCategoryCode(code string) string {
+	words := strings.Split(strings.ToLower(code), "_")
+	for i, w := range words {
+		if w != "" {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 // Match evaluates all non-zero conditions of the rule against a transaction.
@@ -206,7 +240,7 @@ func (r *Rule) Match(tx plaid.Transaction) bool {
 	}
 
 	if c.CategoryIs != "" {
-		if !strings.Contains(strings.ToLower(CategoryString(tx)), strings.ToLower(c.CategoryIs)) {
+		if !strings.Contains(categorySearchText(tx), strings.ToLower(c.CategoryIs)) {
 			return false
 		}
 	}

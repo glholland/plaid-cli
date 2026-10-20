@@ -21,7 +21,9 @@ The CLI really doesn't do all that much but that's the point. It's meant to be a
 - **Interactive Plaid Link Flow**: Spins up a temporary local HTTP server (`localhost:8080` by default), opens Plaid Link in your browser, and exchanges the returned public token securely.
 - **Multi-Item Account Linking**: Re-running `login` adds or updates linked Plaid Items so you can aggregate data across multiple institutions.
 - **Real-time Accounts & Balances**: Query active bank accounts, types, and current/available balances in a cleanly formatted terminal table.
-- **Cursor-Based Sync**: Downloads historical transaction data and incremental updates (additions, modifications, and deletions) using Plaid's `/transactions/sync`, with cursors tracked per Plaid Item in the local cache.
+- **Cursor-Based Sync**: Downloads historical transaction data and incremental updates (additions, modifications, and deletions) using Plaid's `/transactions/sync`, with cursors tracked per Plaid Item in the local cache. If transactions change mid-sync, it restarts automatically, and it never saves a half-finished sync.
+- **Data Freshness Tracking**: `sync` records when each bank was last updated by Plaid and flags Items needing re-authentication. `accounts` shows a freshness table, and `transactions` warns on stderr when cached data is stale.
+- **Modern Categories**: Uses Plaid's `personal_finance_category` taxonomy (e.g. `Food And Drink > Coffee`). Older rules written against the legacy categories keep matching.
 - **Targeted Sync & Local Filtering**: Sync a specific item or account, then query cached transactions instantly with date, account, amount, search, and pending filters.
 - **Table, JSON, and CSV Output**: Render transactions as terminal tables or export to JSON and CSV files for scripting and downstream analysis.
 

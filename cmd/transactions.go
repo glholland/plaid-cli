@@ -189,6 +189,10 @@ var transactionsCmd = &cobra.Command{
 		acctDir := map[string]config.Account{}
 		if cfg, cErr := config.LoadConfig(); cErr == nil {
 			acctDir = cfg.AccountDirectory()
+			// Staleness warnings go to stderr so piped JSON/CSV stays clean.
+			for _, w := range cfg.FreshnessWarnings(time.Now(), config.DefaultStaleAfter) {
+				fmt.Fprintln(os.Stderr, "Warning: "+w)
+			}
 		}
 
 		var outDest *os.File = os.Stdout

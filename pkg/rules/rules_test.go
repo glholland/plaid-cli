@@ -90,6 +90,50 @@ func TestMatchCategoryIs(t *testing.T) {
 	}
 }
 
+func withPFC(t plaid.Transaction, primary, detailed string) plaid.Transaction {
+	pfc := plaid.NewPersonalFinanceCategory(primary, detailed)
+	t.PersonalFinanceCategory = *plaid.NewNullablePersonalFinanceCategory(pfc)
+	return t
+}
+
+func TestCategoryStringPrefersPFC(t *testing.T) {
+	cases := []struct {
+		name string
+		tx   plaid.Transaction
+		want string
+	}{
+		{"pfc preferred over legacy", withPFC(tx("1", "Blue Bottle", 5, "acc", []string{"Food and Drink", "Coffee Shop"}), "FOOD_AND_DRINK", "FOOD_AND_DRINK_COFFEE"), "Food And Drink > Coffee"},
+		{"detailed without primary prefix", withPFC(tx("2", "x", 1, "acc", nil), "TRANSPORTATION", "GAS"), "Transportation > Gas"},
+		{"primary only", withPFC(tx("3", "x", 1, "acc", nil), "INCOME", ""), "Income"},
+		{"legacy fallback", tx("4", "x", 1, "acc", []string{"Shops", "Supermarkets and Groceries"}), "Shops > Supermarkets and Groceries"},
+		{"none", tx("5", "x", 1, "acc", nil), ""},
+	}
+	for _, c := range cases {
+		if got := CategoryString(c.tx); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestMatchCategoryIsMatchesLegacyAndPFC(t *testing.T) {
+	both := withPFC(tx("1", "Target", 30, "acc", []string{"Shops", "Supermarkets and Groceries"}), "FOOD_AND_DRINK", "FOOD_AND_DRINK_GROCERIES")
+	cases := []struct {
+		cond string
+		want bool
+	}{
+		{"supermarkets", true},               // legacy-only wording keeps working
+		{"food and drink > groceries", true}, // humanized PFC display string
+		{"FOOD_AND_DRINK_GROCERIES", true},   // raw PFC code
+		{"travel", false},
+	}
+	for _, c := range cases {
+		r := Rule{Conditions: Conditions{CategoryIs: c.cond}}
+		if got := r.Match(both); got != c.want {
+			t.Errorf("category_is %q: got %v, want %v", c.cond, got, c.want)
+		}
+	}
+}
+
 func TestApply(t *testing.T) {
 	r := Rule{
 		ID: "rule_x",
