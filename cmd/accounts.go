@@ -8,6 +8,7 @@ import (
 	"plaid-cli/pkg/config"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/plaid/plaid-go/v20/plaid"
 	"github.com/spf13/cobra"
@@ -171,8 +172,40 @@ var accountsCmd = &cobra.Command{
 		_ = w.Flush()
 		fmt.Println()
 
+		printItemFreshness(cfg, time.Now())
+
 		return nil
 	},
+}
+
+// printItemFreshness renders per-Item data freshness from the metadata `sync`
+// records via /item/get. It reads only cached config, so it costs no API calls.
+func printItemFreshness(cfg *config.Config, now time.Time) {
+	ago := func(t *time.Time) string {
+		if t == nil {
+			return "-"
+		}
+		return config.HumanizeAge(now.Sub(*t))
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', tabwriter.TabIndent)
+	fmt.Fprintln(w, "ITEM\tLAST SYNCED\tBANK LAST UPDATED\tSTATUS")
+	fmt.Fprintln(w, "----\t-----------\t-----------------\t------")
+	for _, item := range cfg.Items {
+		status := "OK"
+		switch {
+		case item.ItemError != "":
+			status = item.ItemError + " (run 'plaid-cli login --update')"
+		case item.LastSyncedAt == nil:
+			status = "unknown (run 'plaid-cli sync')"
+		case item.TransactionsLastFailedUpdate != nil && (item.TransactionsLastUpdated == nil ||
+			item.TransactionsLastFailedUpdate.After(*item.TransactionsLastUpdated)):
+			status = "last bank update failed " + ago(item.TransactionsLastFailedUpdate)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", item.ItemLabel(), ago(item.LastSyncedAt), ago(item.TransactionsLastUpdated), status)
+	}
+	_ = w.Flush()
+	fmt.Println()
 }
 
 var accountsRemoveCmd = &cobra.Command{

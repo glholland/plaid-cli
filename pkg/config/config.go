@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/plaid/plaid-go/v20/plaid"
 	"golang.org/x/term"
@@ -18,6 +19,16 @@ type LinkedItem struct {
 	InstitutionID   string    `json:"institution_id,omitempty"`
 	InstitutionName string    `json:"institution_name,omitempty"`
 	Accounts        []Account `json:"accounts,omitempty"`
+
+	// Freshness metadata, refreshed by `sync` via /item/get. All optional: configs
+	// written by older versions simply lack them and are treated as "unknown".
+	LastSyncedAt *time.Time `json:"last_synced_at,omitempty"` // last successful local sync
+	// TransactionsLastUpdated is when Plaid last pulled transactions from the institution.
+	TransactionsLastUpdated *time.Time `json:"transactions_last_updated,omitempty"`
+	// TransactionsLastFailedUpdate is when Plaid's last institution pull failed.
+	TransactionsLastFailedUpdate *time.Time `json:"transactions_last_failed_update,omitempty"`
+	// ItemError is the Item-level error code seen at last sync (e.g. ITEM_LOGIN_REQUIRED).
+	ItemError string `json:"item_error,omitempty"`
 }
 
 // Account holds cached metadata for a single account within a linked Item. It

@@ -2,8 +2,10 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"plaid-cli/pkg/config"
+	"time"
 
 	"github.com/plaid/plaid-go/v20/plaid"
 )
@@ -177,6 +179,12 @@ func SyncTransactionsPage(client *plaid.APIClient, accessToken string, cursor st
 	if cursor != "" {
 		request.SetCursor(cursor)
 	}
+	// Explicitly request personal_finance_category, Plaid's current categorization
+	// taxonomy (the legacy `category` field is deprecated). Included with the base
+	// Transactions product at no extra cost.
+	options := plaid.NewTransactionsSyncRequestOptions()
+	options.SetIncludePersonalFinanceCategory(true)
+	request.SetOptions(*options)
 
 	resp, _, err := client.PlaidApi.TransactionsSync(ctx).TransactionsSyncRequest(*request).Execute()
 	if err != nil {
@@ -281,6 +289,45 @@ func RemoveItem(client *plaid.APIClient, accessToken string) error {
 	return nil
 }
 
+// ItemStatus summarizes an Item's data freshness and health from /item/get.
+type ItemStatus struct {
+	// TransactionsLastSuccessfulUpdate is when Plaid last successfully pulled
+	// transactions from the institution (nil if unknown).
+	TransactionsLastSuccessfulUpdate *time.Time
+	// TransactionsLastFailedUpdate is when Plaid's last attempt failed (nil if none).
+	TransactionsLastFailedUpdate *time.Time
+	// ErrorCode is the Item-level error (e.g. ITEM_LOGIN_REQUIRED), or "" if healthy.
+	ErrorCode string
+}
+
+// FetchItemStatus retrieves freshness and health information for an Item via
+// /item/get, which is included with every product at no extra cost.
+func FetchItemStatus(client *plaid.APIClient, accessToken string) (ItemStatus, error) {
+	ctx := context.Background()
+
+	resp, _, err := client.PlaidApi.ItemGet(ctx).ItemGetRequest(*plaid.NewItemGetRequest(accessToken)).Execute()
+	if err != nil {
+		return ItemStatus{}, formatError(err)
+	}
+
+	var st ItemStatus
+	if resp.Item.Error.IsSet() && resp.Item.Error.Get() != nil {
+		st.ErrorCode = resp.Item.Error.Get().ErrorCode
+	}
+	if resp.Status.IsSet() && resp.Status.Get() != nil {
+		txStatus := resp.Status.Get().Transactions
+		if txStatus.IsSet() && txStatus.Get() != nil {
+			if t := txStatus.Get().LastSuccessfulUpdate.Get(); t != nil {
+				st.TransactionsLastSuccessfulUpdate = t
+			}
+			if t := txStatus.Get().LastFailedUpdate.Get(); t != nil {
+				st.TransactionsLastFailedUpdate = t
+			}
+		}
+	}
+	return st, nil
+}
+
 // GetInstitutionInfo returns the institution_id and display name for the given access token.
 // A missing institution on the item is not an error — it returns empty strings.
 func GetInstitutionInfo(client *plaid.APIClient, accessToken string) (institutionID, institutionName string, err error) {
@@ -308,18 +355,44 @@ func GetInstitutionInfo(client *plaid.APIClient, accessToken string) (institutio
 	return institutionID, instResp.Institution.Name, nil
 }
 
-// formatError converts generic Plaid API client errors into structured plaid.PlaidError descriptions.
+// APIError is a structured Plaid API error. Callers can branch on Code via
+// IsPlaidErrorCode (e.g. to retry TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION).
+type APIError struct {
+	Code    string
+	Message string
+	Type    string
+	Display string
+}
+
+func (e *APIError) Error() string {
+	display := e.Display
+	if display == "" {
+		display = "none"
+	}
+	return fmt.Sprintf("Plaid API Error [%s]: %s (Type: %s, Display: %s)", e.Code, e.Message, e.Type, display)
+}
+
+// IsPlaidErrorCode reports whether err wraps a Plaid APIError with the given error_code.
+func IsPlaidErrorCode(err error, code string) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Code == code
+}
+
+// formatError converts generic Plaid API client errors into structured *APIError values.
 func formatError(err error) error {
 	if err == nil {
 		return nil
 	}
 	if plaidErr, convertErr := plaid.ToPlaidError(err); convertErr == nil {
-		displayMsg := "none"
-		if plaidErr.DisplayMessage.IsSet() && plaidErr.DisplayMessage.Get() != nil {
-			displayMsg = *plaidErr.DisplayMessage.Get()
+		apiErr := &APIError{
+			Code:    plaidErr.ErrorCode,
+			Message: plaidErr.ErrorMessage,
+			Type:    string(plaidErr.ErrorType),
 		}
-		return fmt.Errorf("Plaid API Error [%s]: %s (Type: %s, Display: %s)",
-			plaidErr.ErrorCode, plaidErr.ErrorMessage, plaidErr.ErrorType, displayMsg)
+		if plaidErr.DisplayMessage.IsSet() && plaidErr.DisplayMessage.Get() != nil {
+			apiErr.Display = *plaidErr.DisplayMessage.Get()
+		}
+		return apiErr
 	}
 	return err
 }

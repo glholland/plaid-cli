@@ -51,7 +51,11 @@ Stores Plaid API credentials and linked Item metadata.
       "institution_name": "Chase",
       "accounts": [
         { "account_id": "acc_abc", "name": "Rewards Checking", "mask": "5528", "subtype": "checking" }
-      ]
+      ],
+      "last_synced_at": "2026-10-20T13:05:00-04:00",
+      "transactions_last_updated": "2026-10-20T09:12:00Z",
+      "transactions_last_failed_update": null,
+      "item_error": ""
     }
   ]
 }
@@ -60,6 +64,8 @@ Stores Plaid API credentials and linked Item metadata.
 `institution_id` and `institution_name` are fetched from `/item/get` + `/institutions/get_by_id` at link time and cached alongside the token. Any item missing these fields will have them backfilled automatically the next time `accounts remove` is run.
 
 `accounts` is a cached per-account directory (`account_id` → name/mask/subtype) refreshed from Plaid whenever accounts are fetched (`accounts` and `sync`). It lets offline commands render a human-readable account label without a live API call: `transactions` shows `Name (shortid)` (e.g. `Rewards Checking (LAX6Q4M1)`) in its `ACCOUNT` column and adds an `Account` column to CSV while preserving the full `Account ID`. The raw account ID — needed for `rules --account-id` and `transactions --account-id` — remains the canonical reference in the `accounts` table.
+
+`last_synced_at`, `transactions_last_updated`, `transactions_last_failed_update`, and `item_error` are freshness metadata written by `sync`. `last_synced_at` is when plaid-cli last completed a sync for the Item. The other three come from `/item/get` (included with every product at no extra cost): when Plaid last pulled transactions from the institution, when its last pull failed, and any Item-level error code (e.g. `ITEM_LOGIN_REQUIRED`). All four are optional. Configs written by older versions don't have them and are treated as "unknown" until the next `sync`, so no migration is needed.
 
 When `secure: true`, the entire file is AES-256-GCM encrypted on disk (see [Local Cache Encryption](#-local-cache-encryption-implemented)).
 
@@ -273,6 +279,8 @@ Open a browser-based Plaid Link flow via a temporary local server to authenticat
 
 Fetch and display real-time balances for all linked items in a unified table (account ID, name, type/subtype, current balance, available balance, currency).
 
+A second table follows with each Item's data freshness, built from the metadata `sync` records (no extra API calls): `LAST SYNCED` (local sync), `BANK LAST UPDATED` (Plaid's last successful institution pull), and `STATUS`. `STATUS` shows `OK`, the Item error code with a `login --update` hint, `unknown` if the Item has never been synced, or `last bank update failed …` when Plaid's most recent pull failed.
+
 #### `accounts remove [item_id|account_id|number]`
 
 Remove a linked institution. See [Account Removal](#account-removal) for full behavior.
@@ -293,6 +301,12 @@ Incrementally fetch transaction changes (added, modified, removed) from Plaid us
 
 `--item-id` and `--account-id` are mutually exclusive. `--reset` with a targeted flag resets only the matched item's cursor and cached transactions.
 
+**Pagination safety.** Each Item's pages are buffered and applied to the cache only once `has_more` is false, so a failed pass never leaves the cache half-updated. If Plaid returns `TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION`, the buffered pages are discarded and the pass restarts from the cursor it began with, up to 3 times ([Plaid docs](https://plaid.com/docs/transactions/#integration-overview)). Any other error skips the Item, and its cursor isn't advanced.
+
+**Freshness.** Before syncing, `sync` calls `/item/get` for each Item and records its health and last-update times in `config.json` (see the schema above). If an Item reports an error such as `ITEM_LOGIN_REQUIRED`, `sync` prints a warning to stderr pointing at `login --update`.
+
+**Categories.** Sync requests set `include_personal_finance_category`, so each transaction carries Plaid's current `personal_finance_category` taxonomy along with the deprecated legacy `category`.
+
 ### `transactions`
 
 Query and display transactions from the local cache with extensive filtering. Sorted by date descending. When run in a terminal with no date filter specified, presents an interactive prompt:
@@ -305,6 +319,10 @@ Query and display transactions from the local cache with extensive filtering. So
 ```
 
 In non-interactive (piped) mode, defaults to all transactions.
+
+Before rendering, `transactions` prints a warning to **stderr** for each Item that has never been synced, was last synced more than 24 hours ago, or reported an Item error at its last sync. Stdout stays clean for `--format json|csv` pipes.
+
+The displayed category prefers Plaid's `personal_finance_category`, humanized (`FOOD_AND_DRINK` / `FOOD_AND_DRINK_COFFEE` → `Food And Drink > Coffee`), and falls back to the legacy `category` hierarchy when PFC is absent.
 
 | Flag | Description |
 | ------ | ------------- |
@@ -394,7 +412,7 @@ Plaid's default transaction categorization can be noisy or inaccurate. A local r
 | `name_regex` | Full Go regex on transaction name |
 | `account_id` | Exact match on Plaid account ID |
 | `amount_min` / `amount_max` | Inclusive bounds on transaction amount |
-| `category_is` | Case-insensitive substring on Plaid's auto-assigned category string |
+| `category_is` | Case-insensitive substring on Plaid's auto-assigned category. Matches against the humanized `personal_finance_category` (`Food And Drink > Groceries`), the raw PFC codes (`FOOD_AND_DRINK_GROCERIES`), **and** the legacy `category` hierarchy, so rules written before the PFC switch keep matching |
 
 **Actions** (all non-empty fields applied):
 

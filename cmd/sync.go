@@ -6,6 +6,7 @@ import (
 	"plaid-cli/pkg/client"
 	"plaid-cli/pkg/config"
 	"plaid-cli/pkg/rules"
+	"time"
 
 	"github.com/plaid/plaid-go/v20/plaid"
 	"github.com/spf13/cobra"
@@ -110,6 +111,9 @@ using cursor-based synchronization and save them to your local cache (~/.plaid-c
 		// Collected account metadata per item, persisted after the sync loop so
 		// offline commands can render account labels without a live Plaid call.
 		accountDir := make(map[string][]config.Account)
+		// Freshness metadata per item, persisted alongside the account directory.
+		itemStatus := make(map[string]client.ItemStatus)
+		syncedAt := make(map[string]time.Time)
 
 		for idx, item := range targetItems {
 			institutionStr := item.ItemID
@@ -117,6 +121,18 @@ using cursor-based synchronization and save them to your local cache (~/.plaid-c
 				institutionStr = institutionStr[:8]
 			}
 			fmt.Printf("[%d/%d] Syncing transactions for Item %s...\n", idx+1, len(targetItems), institutionStr)
+
+			// 0. Record Item health and Plaid's last institution update (/item/get,
+			// free). This works even when the Item is in an error state, so the
+			// error is captured before the calls below fail on it.
+			if st, err := client.FetchItemStatus(plaidClient, item.AccessToken); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: failed to fetch status for Item %s: %v\n", item.ItemID, err)
+			} else {
+				itemStatus[item.ItemID] = st
+				if st.ErrorCode != "" {
+					fmt.Fprintf(os.Stderr, "  Warning: Item %s reports %s. Run 'plaid-cli login --update' to re-authenticate.\n", item.ItemID, st.ErrorCode)
+				}
+			}
 
 			// 1. Fetch and check linked accounts for the current item
 			accounts, err := client.FetchAccounts(plaidClient, item.AccessToken)
@@ -168,58 +184,64 @@ using cursor-based synchronization and save them to your local cache (~/.plaid-c
 				fmt.Println("  Initial synchronization. This might take a moment...")
 			}
 
-			hasMore := true
-			page := 1
-			var syncErr error
-			for hasMore {
-				fmt.Printf("  Fetching transaction page %d...\n", page)
-				nextCursor, added, modified, removed, more, err := client.SyncTransactionsPage(plaidClient, item.AccessToken, itemCursor)
-				if err != nil {
-					syncErr = fmt.Errorf("sync failed on page %d: %w", page, err)
-					break
+			// Buffer the full pagination pass before touching the cache. SyncItem
+			// restarts from itemCursor if Plaid reports the data mutated mid-pass.
+			fetchPage := client.NewSyncPageFetcher(plaidClient, item.AccessToken)
+			page := 0
+			result, syncErr := client.SyncItem(func(cursor string) (client.SyncPage, error) {
+				if cursor == itemCursor {
+					page = 0 // fresh pass (initial or restarted)
 				}
-
-				// Add
-				for _, tx := range added {
-					txMap[tx.TransactionId] = tx
-					changedIDs[tx.TransactionId] = true
-					addedCount++
-				}
-
-				// Modify
-				for _, tx := range modified {
-					txMap[tx.TransactionId] = tx
-					changedIDs[tx.TransactionId] = true
-					modifiedCount++
-				}
-
-				// Remove
-				for _, rtx := range removed {
-					if rtx.TransactionId != nil {
-						delete(txMap, *rtx.TransactionId)
-						removedCount++
-					}
-				}
-
-				itemCursor = nextCursor
-				hasMore = more
 				page++
+				fmt.Printf("  Fetching transaction page %d...\n", page)
+				return fetchPage(cursor)
+			}, itemCursor, client.DefaultSyncRestarts)
+			if result.Restarts > 0 {
+				fmt.Fprintf(os.Stderr, "  Note: transactions changed during pagination; restarted sync %d time(s).\n", result.Restarts)
 			}
-
 			if syncErr != nil {
 				fmt.Fprintf(os.Stderr, "  Warning: failed to sync transactions for Item %s: %v. Continuing...\n", item.ItemID, syncErr)
 				continue
 			}
 
-			cache.Cursors[item.ItemID] = itemCursor
+			for _, tx := range result.Added {
+				txMap[tx.TransactionId] = tx
+				changedIDs[tx.TransactionId] = true
+				addedCount++
+			}
+			for _, tx := range result.Modified {
+				txMap[tx.TransactionId] = tx
+				changedIDs[tx.TransactionId] = true
+				modifiedCount++
+			}
+			for _, rtx := range result.Removed {
+				if rtx.TransactionId != nil {
+					delete(txMap, *rtx.TransactionId)
+					removedCount++
+				}
+			}
+
+			cache.Cursors[item.ItemID] = result.NextCursor
+			syncedAt[item.ItemID] = time.Now()
 		}
 
 		// Persist the refreshed account directory back to config so offline
 		// commands (e.g. transactions) can render human-readable account labels.
 		dirChanged := false
 		for i := range cfg.Items {
-			if metas, ok := accountDir[cfg.Items[i].ItemID]; ok {
+			id := cfg.Items[i].ItemID
+			if metas, ok := accountDir[id]; ok {
 				cfg.Items[i].Accounts = metas
+				dirChanged = true
+			}
+			if st, ok := itemStatus[id]; ok {
+				cfg.Items[i].ItemError = st.ErrorCode
+				cfg.Items[i].TransactionsLastUpdated = st.TransactionsLastSuccessfulUpdate
+				cfg.Items[i].TransactionsLastFailedUpdate = st.TransactionsLastFailedUpdate
+				dirChanged = true
+			}
+			if t, ok := syncedAt[id]; ok {
+				cfg.Items[i].LastSyncedAt = &t
 				dirChanged = true
 			}
 		}
